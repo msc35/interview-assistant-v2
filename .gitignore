@@ -22,6 +22,11 @@ dist/
 # Local runtime data
 recordings/
 
+# Screenshots: keep only curated README images
+screenshots/*
+!screenshots/main.png
+!screenshots/setup.png
+
 # App local config / secrets
 *.env
 .env

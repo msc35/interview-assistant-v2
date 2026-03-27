@@ -10,6 +10,11 @@ Real-time interview helper for macOS. The app listens to interview audio, transc
 - Setup tab for CV, job description, and custom system prompt
 - Local `.wav` recording option
 
+## Screenshots
+
+![Main Window](screenshots/main.png)
+![Setup Tab](screenshots/setup.png)
+
 ## Requirements
 
 - macOS
