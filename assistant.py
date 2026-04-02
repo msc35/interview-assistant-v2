@@ -1,11 +1,15 @@
+import contextlib
+import io
 import json
 import os
 import queue
 import threading
 import time
+import warnings
 import wave
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
@@ -13,15 +17,160 @@ import google.generativeai as genai
 import pyaudio
 import speech_recognition as sr
 
+warnings.filterwarnings("ignore", module="whisper")
+
+# openai-whisper does not read this; our _patched_whisper_download() does. Default on to stop SHA256 mismatch loops.
+os.environ.setdefault("WHISPER_SKIP_CHECKSUM", "1")
+
 
 CONFIG_DIR = Path.home() / ".interview_assistant"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DEFAULT_ALPHA = 0.96
+
+# Whisper: (model_name, language_or_none). None omits `language` for Whisper auto-detect (mixed TR/EN).
+TRANSCRIPTION_PROFILES = {
+    "English": ("base.en", "en"),
+    "Türkçe": ("small", "tr"),
+    "TR + ENG (Mixed)": ("small", None),
+}
+TRANSCRIPTION_MODES_ORDER = ("English", "Türkçe", "TR + ENG (Mixed)")
+DEFAULT_TRANSCRIPTION_MODE = "TR + ENG (Mixed)"
+WHISPER_CACHE_ROOT = os.path.expanduser("~/.cache/whisper")
+WHISPER_SMALL_PT = Path(WHISPER_CACHE_ROOT) / "small.pt"
+# Expected size ~461 MiB; allow a band for filesystem variance.
+WHISPER_SMALL_BYTES_MIN = 430 * 1024 * 1024
+WHISPER_SMALL_BYTES_MAX = 500 * 1024 * 1024
 TELEPROMPTER_ALPHA = 0.55
 MIN_ALPHA = 0.30
 MAX_ALPHA = 1.00
 
 app_queue = queue.Queue()
+
+
+def _trusted_small_pt_file(path) -> bool:
+    """True if path looks like a complete cached small.pt (~461MB)."""
+    try:
+        p = Path(path)
+        if p.name != "small.pt":
+            return False
+        sz = p.stat().st_size
+    except OSError:
+        return False
+    return WHISPER_SMALL_BYTES_MIN <= sz <= WHISPER_SMALL_BYTES_MAX
+
+
+def _whisper_checksum_skip_env() -> bool:
+    v = os.environ.get("WHISPER_SKIP_CHECKSUM", "").strip().lower()
+    return v in ("1", "true", "yes")
+
+
+def _patched_whisper_download(url: str, root: str, in_memory: bool):
+    """
+    Replacement for whisper._download: accept on-disk file when SHA256 mismatches
+    (stale hashes in older whisper releases) if WHISPER_SKIP_CHECKSUM is set or small.pt is size-valid.
+    """
+    import hashlib
+    import urllib.request
+
+    from tqdm import tqdm
+
+    os.makedirs(root, exist_ok=True)
+    expected_sha256 = url.split("/")[-2]
+    download_target = os.path.join(root, os.path.basename(url))
+    trust_mismatch = _whisper_checksum_skip_env() or _trusted_small_pt_file(download_target)
+
+    if os.path.exists(download_target) and not os.path.isfile(download_target):
+        raise RuntimeError(f"{download_target} exists and is not a regular file")
+
+    if os.path.isfile(download_target):
+        with open(download_target, "rb") as f:
+            model_bytes = f.read()
+        if hashlib.sha256(model_bytes).hexdigest() == expected_sha256:
+            return model_bytes if in_memory else download_target
+        if trust_mismatch:
+            return model_bytes if in_memory else download_target
+        import warnings as std_warnings
+
+        std_warnings.warn(
+            f"{download_target} exists, but the SHA256 checksum does not match; re-downloading the file"
+        )
+
+    with urllib.request.urlopen(url) as source, open(download_target, "wb") as output:
+        with tqdm(
+            total=int(source.info().get("Content-Length")),
+            ncols=80,
+            unit="iB",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as loop:
+            while True:
+                buffer = source.read(8192)
+                if not buffer:
+                    break
+                output.write(buffer)
+                loop.update(len(buffer))
+
+    model_bytes = open(download_target, "rb").read()
+    if hashlib.sha256(model_bytes).hexdigest() != expected_sha256:
+        if trust_mismatch or _trusted_small_pt_file(download_target):
+            return model_bytes if in_memory else download_target
+        raise RuntimeError(
+            "Model has been downloaded but the SHA256 checksum does not not match. Please retry loading the model."
+        )
+    return model_bytes if in_memory else download_target
+
+
+def _install_whisper_checksum_patch() -> None:
+    import whisper
+
+    if getattr(whisper, "_interview_assistant_checksum_patch", False):
+        return
+    whisper._download = _patched_whisper_download
+    whisper._interview_assistant_checksum_patch = True
+
+
+_whisper_model_cache = {}
+_whisper_model_cache_lock = threading.Lock()
+
+
+def get_cached_whisper_model(model_name: str):
+    """
+    Load each Whisper model name at most once (avoids RAM blowups from recognize_whisper's per-call load_model).
+    Thread-safe; used by preload and the single transcription worker.
+    """
+    _install_whisper_checksum_patch()
+    with _whisper_model_cache_lock:
+        if model_name not in _whisper_model_cache:
+            import whisper
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    _whisper_model_cache[model_name] = whisper.load_model(
+                        model_name, download_root=WHISPER_CACHE_ROOT
+                    )
+        return _whisper_model_cache[model_name]
+
+
+def transcribe_audio_with_cached_model(audio_data: sr.AudioData, model_name: str, language: Optional[str]) -> str:
+    """Match speech_recognition's whisper path: 16 kHz WAV -> float32 numpy -> model.transcribe."""
+    import soundfile as sf
+    import torch
+
+    wmodel = get_cached_whisper_model(model_name)
+    wav_bytes = audio_data.get_wav_data(convert_rate=16000)
+    wav_stream = io.BytesIO(wav_bytes)
+    audio_array, _sample_rate = sf.read(wav_stream)
+    audio_array = audio_array.astype("float32")
+    kwargs = {"fp16": torch.cuda.is_available()}
+    if language is not None:
+        kwargs["language"] = language
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            result = wmodel.transcribe(audio_array, **kwargs)
+    text = (result.get("text") or "").strip()
+    return text
 
 
 def get_ai_suggestion(user_question, system_prompt, api_key, conversation_history=None):
@@ -67,6 +216,8 @@ class AssistantApp:
         self.root.geometry("980x860")
         self.root.minsize(860, 700)
 
+        _install_whisper_checksum_patch()
+
         self._setup_theme()
         self.root.configure(bg=self.BG_COLOR)
 
@@ -97,6 +248,12 @@ class AssistantApp:
         self.recognizer.operation_timeout = None
         self.stop_listening = None
 
+        self._transcription_queue = queue.Queue()
+        threading.Thread(target=self._transcription_worker_loop, daemon=True).start()
+
+        self.transcription_mode_var = tk.StringVar(value=DEFAULT_TRANSCRIPTION_MODE)
+        self._transcribe_model, self._transcribe_language = TRANSCRIPTION_PROFILES[DEFAULT_TRANSCRIPTION_MODE]
+
         self.available_microphones = []
         self.microphone_device_index = self.find_microphone_device()
         self.device_text.set(f"Device: {self.get_device_name(self.microphone_device_index)}")
@@ -111,6 +268,8 @@ class AssistantApp:
         self.apply_alpha(self.alpha_value)
 
         self._build_layout()
+
+        threading.Thread(target=self._preload_whisper_small, daemon=True).start()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root.after(100, self.check_queue)
@@ -231,6 +390,30 @@ class AssistantApp:
         self.history_label = ttk.Label(history_badge, text="History: 0/5", background=self.CARD_COLOR, foreground=self.TEXT_SECONDARY)
         self.history_label.pack(padx=10, pady=4)
 
+        response_card = ttk.LabelFrame(self.assistant_tab, text="AI Response", style="Card.TLabelframe")
+        response_card.pack(fill="both", expand=True, padx=12, pady=(4, 8))
+        response_controls = tk.Frame(response_card, bg=self.CARD_COLOR)
+        response_controls.pack(fill="x", padx=10, pady=(10, 6))
+        self.get_suggestion_button = ttk.Button(
+            response_controls, text="Get AI Suggestion", command=self.fetch_suggestion, style="Accent.TButton"
+        )
+        self.get_suggestion_button.pack(side=tk.LEFT)
+        self.suggestion_text = scrolledtext.ScrolledText(
+            response_card,
+            height=10,
+            state="disabled",
+            font=("SF Mono", 17),
+            bg=self.TEXT_AREA_BG,
+            fg=self.TEXT_COLOR,
+            wrap=tk.WORD,
+            relief="flat",
+            borderwidth=0,
+            padx=12,
+            pady=10,
+            selectbackground=self.ACCENT_COLOR,
+        )
+        self.suggestion_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
         listening_card = ttk.LabelFrame(self.assistant_tab, text="Listening", style="Card.TLabelframe")
         listening_card.pack(fill="x", padx=12, pady=(4, 8))
         listening_body = tk.Frame(listening_card, bg=self.CARD_COLOR)
@@ -259,7 +442,7 @@ class AssistantApp:
         self.recording_status_label.pack(side=tk.LEFT, padx=10)
 
         question_card = ttk.LabelFrame(self.assistant_tab, text="Question (Editable)", style="Card.TLabelframe")
-        question_card.pack(fill="both", expand=True, padx=12, pady=(4, 8))
+        question_card.pack(fill="both", expand=True, padx=12, pady=(4, 10))
         self.question_text = scrolledtext.ScrolledText(
             question_card,
             height=6,
@@ -275,30 +458,6 @@ class AssistantApp:
             wrap=tk.WORD,
         )
         self.question_text.pack(fill="both", expand=True, padx=10, pady=10)
-
-        response_card = ttk.LabelFrame(self.assistant_tab, text="AI Response", style="Card.TLabelframe")
-        response_card.pack(fill="both", expand=True, padx=12, pady=(4, 10))
-        response_controls = tk.Frame(response_card, bg=self.CARD_COLOR)
-        response_controls.pack(fill="x", padx=10, pady=(10, 6))
-        self.get_suggestion_button = ttk.Button(
-            response_controls, text="Get AI Suggestion", command=self.fetch_suggestion, style="Accent.TButton"
-        )
-        self.get_suggestion_button.pack(side=tk.LEFT)
-        self.suggestion_text = scrolledtext.ScrolledText(
-            response_card,
-            height=10,
-            state="disabled",
-            font=("SF Mono", 17),
-            bg=self.TEXT_AREA_BG,
-            fg=self.TEXT_COLOR,
-            wrap=tk.WORD,
-            relief="flat",
-            borderwidth=0,
-            padx=12,
-            pady=10,
-            selectbackground=self.ACCENT_COLOR,
-        )
-        self.suggestion_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
     def create_setup_tab(self):
         container = tk.Frame(self.setup_tab, bg=self.BG_COLOR)
@@ -360,6 +519,22 @@ class AssistantApp:
         ttk.Button(device_row, text="Refresh", command=self.refresh_microphone_list, style="Rounded.TButton").pack(side=tk.LEFT, padx=4)
         ttk.Button(device_row, text="Use Selected", command=self.apply_selected_microphone, style="Rounded.TButton").pack(side=tk.LEFT, padx=4)
         api_body.columnconfigure(0, weight=1)
+
+        ttk.Label(api_body, text="Transcription language", background=self.CARD_COLOR).grid(
+            row=6, column=0, sticky="w", pady=(12, 0)
+        )
+        transcription_row = tk.Frame(api_body, bg=self.CARD_COLOR)
+        transcription_row.grid(row=7, column=0, columnspan=3, sticky="we", pady=(4, 0))
+        self.transcription_combo = ttk.Combobox(
+            transcription_row,
+            textvariable=self.transcription_mode_var,
+            values=TRANSCRIPTION_MODES_ORDER,
+            state="readonly",
+            width=50,
+        )
+        self.transcription_combo.pack(side=tk.LEFT, fill="x", expand=True)
+        self.transcription_mode_var.trace_add("write", self._on_transcription_mode_write)
+        self._apply_transcription_mode_key()
 
         cv_card = ttk.LabelFrame(scrollable, text="CV", style="Card.TLabelframe")
         cv_card.pack(fill="both", expand=True, pady=(0, 10))
@@ -423,29 +598,34 @@ class AssistantApp:
         self.system_prompt_text.pack(fill="both", expand=True, padx=10, pady=10)
 
         default_system_prompt = """
-You are my interview coach. I'm in a live job interview right now.
+You are my real-time interview copilot. I'm presenting my data science case study and answering questions live — speed matters.
 
-Goal: Give me ready-to-speak answers I can say out loud or paraphrase naturally.
+Language: Answer in Turkish. Use English for technical terms naturally (ARPU, churn, SHAP, LightGBM, PR-AUC, pipeline, ROAS, retention, conversion rate, etc.) — exactly how Turkish data scientists speak.
 
-Rules:
-- 3–5 sentences max. No filler, no preamble.
-- Bullet points only when listing 2+ items.
-- Sound confident and conversational — not robotic or overly formal.
-- Start answers directly. Never say "Great question" or similar.
-- If the question is behavioral (e.g. "Tell me about a time..."), use a tight STAR format (Situation → Action → Result, skip the Task label).
-- If technical, be precise and concise. Show depth in few words.
+Format:
+- 4–6 sentences max. I need to read and speak this in seconds.
+- No intro, no filler, no "Harika soru" or "Şöyle açıklayayım".
+- Start with the answer. Lead with the strongest point.
+- Bullet points ONLY if listing 3+ items side by side.
+- Numbers and metrics first, explanation second.
+
+Style:
+- First person, natural spoken Turkish cadence.
+- Confident but not arrogant. Like a senior data scientist defending their own work.
+- End every answer with a concrete metric, result, or decision — never trail off.
+
+For technical questions: If it's a concept/definition question ("X nedir", "Y'yi açıkla", "Z ne demek"), give a clean textbook-level explanation first — only tie to the case if it flows naturally in one short clause. If it's a case-specific technical question ("neden X kullandın", "şu metrik neden düşük"), then give the metric, the method, the why — in that order.
+For "neden bu approach" questions: State the decision, then the tradeoff I considered.
+For "what if" / challenge questions: Acknowledge the concern in one clause, then defend with data.
+For questions about a specific section: Pull the exact numbers from the case context below.
 
 My background:
 --- {cv} ---
 
-Role I'm interviewing for:
+Role, job description, and my full case study summary are all here — use this as the single source of truth for every answer:
 --- {job_description} ---
 
-Instructions:
-1. Answer as if I'm speaking — first person, natural cadence.
-2. Weave in specifics from my CV when relevant, don't force them.
-3. If the question is vague, give the strongest reasonable interpretation and answer that.
-4. End strong — last sentence should land a clear point, not trail off.
+Golden rule: If my answer can be shorter and still land the point, make it shorter.
 """
         self.system_prompt_text.insert(tk.END, default_system_prompt.strip())
 
@@ -465,7 +645,10 @@ Instructions:
             wrap=tk.WORD,
         )
         self.user_prompt_text.pack(fill="x", expand=True, padx=10, pady=10)
-        self.user_prompt_text.insert(tk.END, 'The latest question from the professor is: "{transcribed_text}"')
+        self.user_prompt_text.insert(
+            tk.END,
+            "Interviewer's question: \"{transcribed_text}\". Give me a ready-to-speak answer. Turkish with English technical terms.",
+        )
         self.refresh_microphone_list()
 
     def config_payload(self):
@@ -473,6 +656,7 @@ Instructions:
             "api_key": self.api_key_var.get().strip(),
             "window_alpha": round(self.alpha_value, 2),
             "microphone_device_index": self.microphone_device_index,
+            "transcription_mode": self.transcription_mode_var.get(),
         }
 
     def load_config(self):
@@ -486,6 +670,10 @@ Instructions:
                 saved_device = config.get("microphone_device_index")
                 if isinstance(saved_device, int):
                     self.microphone_device_index = saved_device
+                tm = config.get("transcription_mode", DEFAULT_TRANSCRIPTION_MODE)
+                if tm in TRANSCRIPTION_PROFILES:
+                    self.transcription_mode_var.set(tm)
+                    self._apply_transcription_mode_key(tm)
         except Exception as err:
             print(f"Config load error: {err}")
 
@@ -621,34 +809,94 @@ Instructions:
         except Exception:
             self.status_text.set("Could not parse selected device")
 
+    def _apply_transcription_mode_key(self, key=None):
+        if key is None:
+            key = self.transcription_mode_var.get()
+        if key not in TRANSCRIPTION_PROFILES:
+            key = DEFAULT_TRANSCRIPTION_MODE
+            self.transcription_mode_var.set(key)
+        self._transcribe_model, self._transcribe_language = TRANSCRIPTION_PROFILES[key]
+
+    def _on_transcription_mode_write(self, *_args):
+        self._apply_transcription_mode_key()
+        self.save_config()
+
+    def _preload_whisper_small(self):
+        def set_status(msg):
+            if not self.is_closing:
+                self.root.after(0, lambda m=msg: self.status_text.set(m))
+
+        _install_whisper_checksum_patch()
+        cached_ok = WHISPER_SMALL_PT.exists() and _trusted_small_pt_file(WHISPER_SMALL_PT)
+        show_status = not cached_ok
+
+        if show_status:
+            set_status("Downloading language model...")
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    get_cached_whisper_model("small")
+        finally:
+            if show_status:
+                set_status("Language model ready")
+
+    def _schedule_capture_status(self, message: str):
+        if self.is_closing:
+            return
+
+        def apply():
+            try:
+                self.capture_text.set(message)
+            except tk.TclError:
+                pass
+
+        try:
+            self.root.after(0, apply)
+        except tk.TclError:
+            pass
+
+    def _transcription_worker_loop(self):
+        while True:
+            item = self._transcription_queue.get()
+            if item is None:
+                break
+            audio, model_name, lang, mode = item
+            try:
+                print(f"[Transcription] mode={mode} model={model_name} lang={lang}")
+                text = transcribe_audio_with_cached_model(audio, model_name, lang)
+                if text and text.strip():
+                    app_queue.put(text)
+                    self.last_transcription_time = time.time()
+                    self._schedule_capture_status("Capture: transcribed")
+                else:
+                    self._schedule_capture_status("Capture: silence")
+            except Exception as err:
+                error_msg = str(err).lower()
+                if "could not" not in error_msg and "not understand" not in error_msg:
+                    print(f"Transcription error: {str(err)[:100]}")
+                self._schedule_capture_status("Capture: transcription error")
+
     def on_closing(self):
         self.is_closing = True
         if self.stop_listening:
             self.stop_listening(wait_for_stop=False)
         if self.is_recording:
             self.stop_recording()
+        try:
+            self._transcription_queue.put_nowait(None)
+        except Exception:
+            pass
         self.save_config()
         self.root.destroy()
 
     def audio_callback(self, recognizer, audio):
-        def process_audio():
-            try:
-                text = recognizer.recognize_whisper(audio, model="base.en", language="en")
-                if text and text.strip():
-                    app_queue.put(text)
-                    self.last_transcription_time = time.time()
-                    self.root.after(0, lambda: self.capture_text.set("Capture: transcribed"))
-                else:
-                    self.root.after(0, lambda: self.capture_text.set("Capture: silence"))
-            except sr.UnknownValueError:
-                self.root.after(0, lambda: self.capture_text.set("Capture: unrecognized speech"))
-            except Exception as err:
-                error_msg = str(err).lower()
-                if "could not" not in error_msg and "not understand" not in error_msg:
-                    print(f"Transcription error: {str(err)[:100]}")
-                self.root.after(0, lambda: self.capture_text.set("Capture: transcription error"))
-
-        threading.Thread(target=process_audio, daemon=True).start()
+        if self.is_closing:
+            return
+        model_name = self._transcribe_model
+        lang = self._transcribe_language
+        mode = self.transcription_mode_var.get()
+        self._transcription_queue.put((audio, model_name, lang, mode))
 
     def toggle_listening(self):
         if self.stop_listening:
